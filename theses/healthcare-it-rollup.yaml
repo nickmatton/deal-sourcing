@@ -1,0 +1,27 @@
+thesis:
+  id: "healthcare-it-rollup"
+  description: "Acquire and integrate regional healthcare IT services companies"
+  sector:
+    - "healthcare IT"
+    - "health tech services"
+    - "EHR consulting"
+  revenue_range: [5000000, 50000000]
+  ebitda_margin_floor: 0.15
+  geography:
+    - "US"
+    - "CA"
+  ownership_preference:
+    - "founder"
+    - "family"
+  growth_floor: 0.05
+  must_have:
+    - "recurring revenue > 40%"
+    - "10+ enterprise clients"
+  nice_to_have:
+    - "SOC 2 certified"
+    - "government contracts"
+  anti_patterns:
+    - "single-customer concentration > 30%"
+    - "declining revenue"
+  deal_type: "platform"
+  active: true
