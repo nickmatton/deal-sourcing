@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import curses
+import io
 import locale
+import logging
 import os
 import queue
 import sys
@@ -18,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import structlog
 
 from src.common.schemas.ingestion import CompanyNormalized, TransactionRecord
 from src.common.schemas.underwriting import LBOAssumptions, UnderwritingResult
@@ -71,6 +74,7 @@ class PipelineState:
     running: bool = False
     complete: bool = False
     error: str | None = None
+    substatus: str = ""
 
 
 class BloombergTerminal:
@@ -125,18 +129,52 @@ class BloombergTerminal:
 
     def run(self) -> None:
         locale.setlocale(locale.LC_ALL, "")
-        saved_stderr = sys.stderr
-        sys.stderr = open(os.devnull, "w")
+        self._suppress_output()
         try:
             curses.wrapper(self._main)
         finally:
-            sys.stderr.close()
-            sys.stderr = saved_stderr
+            self._restore_output()
+
+    def _suppress_output(self) -> None:
+        """Suppress all logging and stray output to prevent curses corruption."""
+        # Disable stdlib logging globally
+        logging.disable(logging.CRITICAL)
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.addHandler(logging.NullHandler())
+
+        # Force structlog to write to a black hole.
+        # cache_logger_on_first_use=False ensures already-created BoundLoggers
+        # pick up the new factory on their next call instead of using a cached
+        # PrintLogger that would write to stdout.
+        structlog.configure(
+            logger_factory=structlog.PrintLoggerFactory(file=io.StringIO()),
+            cache_logger_on_first_use=False,
+        )
+
+        # Redirect fd 2 (stderr) at the OS level so even C-level writes
+        # to stderr go to /dev/null instead of the terminal.
+        self._saved_stderr = sys.stderr
+        self._saved_stderr_fd = os.dup(2)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, 2)
+        os.close(devnull_fd)
+        sys.stderr = open(os.devnull, "w")
+
+    def _restore_output(self) -> None:
+        """Restore stderr and logging after curses exits."""
+        sys.stderr.close()
+        sys.stderr = self._saved_stderr
+        os.dup2(self._saved_stderr_fd, 2)
+        os.close(self._saved_stderr_fd)
+        logging.disable(logging.NOTSET)
 
     def _main(self, scr: curses.window) -> None:
         self.scr = scr
         self._init_colors()
         curses.curs_set(0)
+        scr.clear()
+        scr.refresh()
         scr.timeout(100)
         self._launch_pipeline()
 
@@ -206,6 +244,7 @@ class BloombergTerminal:
         k = ev[0]
         if k == "stage_start":
             self.ps.stage = ev[1]
+            self.ps.substatus = ""
         elif k == "stage_done":
             self.ps.stages_completed.add(ev[1])
         elif k == "stage_error":
@@ -234,6 +273,8 @@ class BloombergTerminal:
             self.ps.complete = True
             self.ps.running = False
             self._do_sort()
+        elif k == "substatus":
+            self.ps.substatus = ev[1]
         elif k == "err":
             self.ps.error = ev[1]
 
@@ -285,7 +326,10 @@ class BloombergTerminal:
         # ── Stage: Ingestion ─────────────────────────────────────────────
         q.put(("stage_start", "ingestion"))
         try:
-            connector = ClaudeResearchConnector(model=self.model)
+            connector = ClaudeResearchConnector(
+                model=self.model,
+                on_progress=lambda msg: q.put(("substatus", msg)),
+            )
             raw = await connector.fetch_companies(
                 sector=sector,
                 geography=self.geography,
@@ -623,6 +667,12 @@ class BloombergTerminal:
             if detail:
                 self._w(y, 20, detail, gd)
             y += 1
+
+        # Live substatus from Claude CLI
+        if ps.substatus and not ps.complete:
+            y += 1
+            # Truncate to fit screen, prefix with a dim arrow
+            self._w(y, 4, f"\u25B8 {ps.substatus}", curses.color_pair(C_CYAN))
 
         y += 1
         if ps.error:

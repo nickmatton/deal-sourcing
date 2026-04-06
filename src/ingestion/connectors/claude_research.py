@@ -5,6 +5,7 @@ Uses your existing Claude subscription via `claude -p` instead of paid API keys.
 
 import json
 import subprocess
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 import structlog
@@ -141,11 +142,21 @@ OWNERSHIP_MAP = {
 }
 
 
-def _call_claude(prompt: str, schema: dict, model: str = "sonnet", timeout: int = 600) -> dict:
+def _call_claude(
+    prompt: str,
+    schema: dict,
+    model: str = "sonnet",
+    timeout: int = 600,
+    on_progress: Callable[[str], None] | None = None,
+) -> dict:
     """Call Claude Code CLI with streaming output so we can log progress.
 
     Uses --output-format stream-json to get real-time events (tool calls,
     reasoning, partial responses) and logs them as they arrive.
+
+    Args:
+        on_progress: Optional callback invoked with human-readable status
+            strings as the CLI streams events (web searches, tool use, etc.).
     """
     full_prompt = (
         f"You MUST respond with ONLY a valid JSON object, no other text. "
@@ -160,7 +171,12 @@ def _call_claude(prompt: str, schema: dict, model: str = "sonnet", timeout: int 
         full_prompt,
     ]
 
-    logger.info("claude_cli.calling", prompt_len=len(full_prompt), model=model, timeout=timeout)
+    def _notify(msg: str) -> None:
+        logger.info(msg)
+        if on_progress:
+            on_progress(msg)
+
+    _notify(f"Calling Claude CLI (model={model})...")
 
     proc = subprocess.Popen(
         cmd,
@@ -184,7 +200,7 @@ def _call_claude(prompt: str, schema: dict, model: str = "sonnet", timeout: int 
             esubtype = event.get("subtype", "")
 
             if etype == "system" and esubtype == "init":
-                logger.info("claude_cli.session_started", session=event.get("session_id", "")[:8])
+                _notify("Claude session started")
 
             elif etype == "assistant":
                 msg = event.get("message", {})
@@ -192,26 +208,20 @@ def _call_claude(prompt: str, schema: dict, model: str = "sonnet", timeout: int 
                     if block.get("type") == "tool_use":
                         tool = block.get("name", "unknown")
                         tool_input = block.get("input", {})
-                        # Log the tool being used — shows web searches, file reads, etc.
                         if tool in ("WebSearch", "web_search"):
                             query = tool_input.get("query", "")
-                            logger.info("claude_cli.web_search", query=query[:100])
+                            _notify(f"Web search: {query[:80]}")
                         elif tool in ("WebFetch", "web_fetch"):
                             url = tool_input.get("url", "")
-                            logger.info("claude_cli.web_fetch", url=url[:100])
+                            _notify(f"Fetching: {url[:80]}")
                         else:
-                            logger.info("claude_cli.tool_use", tool=tool)
-                    elif block.get("type") == "text":
-                        text_preview = block.get("text", "")[:120]
-                        if text_preview:
-                            logger.debug("claude_cli.text", preview=text_preview)
+                            _notify(f"Tool: {tool}")
                     elif block.get("type") == "thinking":
-                        thinking = block.get("thinking", "")[:150]
+                        thinking = block.get("thinking", "")[:100]
                         if thinking:
-                            logger.info("claude_cli.reasoning", thought=thinking)
+                            _notify(f"Reasoning: {thinking}")
 
             elif etype == "tool_result":
-                # Tool finished — log it
                 tool_name = event.get("tool_name", "")
                 if tool_name:
                     logger.debug("claude_cli.tool_done", tool=tool_name)
@@ -221,12 +231,8 @@ def _call_claude(prompt: str, schema: dict, model: str = "sonnet", timeout: int 
                 cost = event.get("total_cost_usd", 0)
                 duration = event.get("duration_ms", 0)
                 turns = event.get("num_turns", 0)
-                logger.info(
-                    "claude_cli.done",
-                    duration_s=round(duration / 1000, 1),
-                    turns=turns,
-                    cost_usd=round(cost, 4),
-                    is_error=event.get("is_error", False),
+                _notify(
+                    f"Done ({duration / 1000:.1f}s, {turns} turns, ${cost:.4f})"
                 )
 
         proc.wait(timeout=timeout)
@@ -270,8 +276,13 @@ class ClaudeResearchConnector(BaseConnector):
 
     source_name = "claude_research"
 
-    def __init__(self, model: str = "sonnet") -> None:
+    def __init__(
+        self,
+        model: str = "sonnet",
+        on_progress: Callable[[str], None] | None = None,
+    ) -> None:
         self._model = model
+        self._on_progress = on_progress
 
     async def fetch_companies(
         self,
@@ -302,7 +313,9 @@ class ClaudeResearchConnector(BaseConnector):
         )
 
         logger.info("fetch_companies", sector=sector, geography=geography, count=count)
-        data = _call_claude(prompt, COMPANY_SCHEMA, self._model)
+        if self._on_progress:
+            self._on_progress("Researching companies...")
+        data = _call_claude(prompt, COMPANY_SCHEMA, self._model, on_progress=self._on_progress)
 
         results = []
         now = self._now_iso()
@@ -360,7 +373,9 @@ class ClaudeResearchConnector(BaseConnector):
         )
 
         logger.info("fetch_transactions", sector=sector, geography=geography, count=count)
-        data = _call_claude(prompt, TRANSACTION_SCHEMA, self._model)
+        if self._on_progress:
+            self._on_progress("Researching transactions...")
+        data = _call_claude(prompt, TRANSACTION_SCHEMA, self._model, on_progress=self._on_progress)
 
         results = []
         now_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
