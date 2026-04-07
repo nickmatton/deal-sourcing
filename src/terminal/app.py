@@ -75,6 +75,7 @@ class PipelineState:
     complete: bool = False
     error: str | None = None
     substatus: str = ""
+    log_lines: list[str] = field(default_factory=list)
 
 
 class BloombergTerminal:
@@ -120,6 +121,7 @@ class BloombergTerminal:
         self.sort_idx = 4  # IRR by default
         self.sort_desc = True
         self.detail_scroll = 0
+        self.log_scroll_back = 0
         self.tick = 0
         self.scr: curses.window | None = None
 
@@ -275,6 +277,9 @@ class BloombergTerminal:
             self._do_sort()
         elif k == "substatus":
             self.ps.substatus = ev[1]
+            self.ps.log_lines.append(f"~ {ev[1]}")
+        elif k == "log":
+            self.ps.log_lines.append(ev[1])
         elif k == "err":
             self.ps.error = ev[1]
 
@@ -292,6 +297,7 @@ class BloombergTerminal:
         self.view = "loading"
         self.sel = 0
         self.scroll = 0
+        self.log_scroll_back = 0
         threading.Thread(target=self._pipeline_thread, daemon=True).start()
 
     def _pipeline_thread(self) -> None:
@@ -338,12 +344,25 @@ class BloombergTerminal:
             )
             q.put(("raw", len(raw)))
 
+            q.put(("log", ""))
+            q.put(("log", "! \u2500\u2500 Companies Discovered \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"))
+            for i, c in enumerate(raw):
+                rev_str = f"${c.estimated_revenue / 1e6:.1f}M" if c.estimated_revenue else "rev N/A"
+                q.put(("log", f"  {i + 1:>2}. {c.name:<30} {(c.industry or 'N/A'):<20} {rev_str}"))
+
             txns = await connector.fetch_transactions(
                 sector=sector,
                 geography=self.geography,
                 count=max(self.count, 5),
             )
             q.put(("txn", txns))
+
+            q.put(("log", ""))
+            q.put(("log", "! \u2500\u2500 Comparable Transactions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"))
+            for i, tx in enumerate(txns):
+                ev_str = f"EV ${tx.enterprise_value / 1e6:.0f}M" if tx.enterprise_value else "EV undisclosed"
+                q.put(("log", f"  {i + 1:>2}. {tx.target_name:<28} \u2190 {(tx.buyer_name or 'undisclosed'):<20} {ev_str}"))
+
             q.put(("stage_done", "ingestion"))
         except Exception as e:
             q.put(("stage_error", "ingestion"))
@@ -357,6 +376,12 @@ class BloombergTerminal:
             er = EntityResolutionEngine()
             normalized = [normalize_company(r, er.resolve(r)) for r in raw]
             q.put(("resolved", normalized))
+
+            q.put(("log", ""))
+            q.put(("log", "! \u2500\u2500 Resolved Entities \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"))
+            for norm in normalized:
+                q.put(("log", f"  {norm.entity_id[:8]}  {norm.name}"))
+
             q.put(("stage_done", "entity_resolution"))
         except Exception as e:
             q.put(("stage_error", "entity_resolution"))
@@ -372,6 +397,14 @@ class BloombergTerminal:
                 passing, rejected = filter_universe(normalized, thesis)
                 q.put(("filtered", passing, len(rejected)))
                 targets = passing
+
+                q.put(("log", ""))
+                q.put(("log", "! \u2500\u2500 Thesis Matching Results \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"))
+                for c in passing:
+                    q.put(("log", f"+ \u2713 {c.name}"))
+                for c, gaps in rejected:
+                    q.put(("log", f"- \u2717 {c.name} ({', '.join(gaps)})"))
+
                 q.put(("stage_done", "thesis_matching"))
             except Exception as e:
                 q.put(("stage_error", "thesis_matching"))
@@ -415,6 +448,28 @@ class BloombergTerminal:
                 )
                 val_pairs.append((company, val))
                 q.put(("val", company, val))
+
+                # Emit valuation math to activity log
+                q.put(("log", ""))
+                q.put(("log", f"! \u250c\u2500 VALUING: {company.name} {'\u2500' * max(1, 40 - len(company.name))}"))
+                rev_src = "known" if company.estimated_revenue_usd else "estimated"
+                q.put(("log", f"> \u2502 Revenue      = ${val.estimated_revenue:,.0f}  ({rev_src})"))
+                if val.estimated_ebitda and val.estimated_revenue and val.estimated_revenue > 0:
+                    margin = val.estimated_ebitda / val.estimated_revenue
+                    q.put(("log", f"> \u2502 EBITDA       = ${val.estimated_ebitda:,.0f}  (margin: {margin:.1%})"))
+                else:
+                    eb_str = f"${val.estimated_ebitda:,.0f}" if val.estimated_ebitda else "N/A"
+                    q.put(("log", f"> \u2502 EBITDA       = {eb_str}"))
+                mult = val.implied_ev_ebitda_multiple or 8.0
+                q.put(("log", f"> \u2502 Multiple     = {mult:.1f}x EV/EBITDA"))
+                q.put(("log", f"> \u2502"))
+                q.put(("log", f"> \u2502 EV = EBITDA \u00d7 Multiple \u00d7 (1 \u2212 illiquidity_discount)"))
+                eb_val = val.estimated_ebitda or 0
+                q.put(("log", f"> \u2502    = ${eb_val:,.0f} \u00d7 {mult:.1f} \u00d7 (1 \u2212 {val.illiquidity_discount_applied:.0%})"))
+                q.put(("log", f"> \u2502    = ${val.ev_point_estimate:,.0f}"))
+                q.put(("log", f"> \u2502"))
+                q.put(("log", f"> \u2502 80% CI = [${val.ev_range_80ci[0]:,.0f} \u2014 ${val.ev_range_80ci[1]:,.0f}]  (\u00b130%)"))
+                q.put(("log", f"+ \u2514\u2500 Grade: {val.confidence_grade.value}  |  EV: ${val.ev_point_estimate:,.0f}"))
             except ValueError:
                 continue
 
@@ -451,6 +506,32 @@ class BloombergTerminal:
                 assumptions=assumptions,
             )
             q.put(("uw", company, val, result))
+
+            # Emit underwriting math to activity log
+            q.put(("log", ""))
+            q.put(("log", f"! \u250c\u2500 UNDERWRITING: {company.name} {'\u2500' * max(1, 36 - len(company.name))}"))
+            q.put(("log", f"> \u2502 Monte Carlo Simulation  n={assumptions.num_simulations:,}"))
+            q.put(("log", f"> \u2502"))
+            q.put(("log", f"> \u2502 Entry EBITDA   ~ N(\u03bc=${assumptions.entry_ebitda_mean:,.0f}, \u03c3=${assumptions.entry_ebitda_std:,.0f})"))
+            q.put(("log", f"> \u2502 Entry Multiple ~ Tri({assumptions.entry_multiple_low:.1f}, {assumptions.entry_multiple_mode:.1f}, {assumptions.entry_multiple_high:.1f})"))
+            q.put(("log", f"> \u2502 Rev Growth     ~ N(\u03bc={assumptions.revenue_growth_mean:.0%}, \u03c3={assumptions.revenue_growth_std:.0%})"))
+            q.put(("log", f"> \u2502"))
+            q.put(("log", f"> \u2502 Entry EV    = EBITDA \u00d7 Entry_Multiple"))
+            q.put(("log", f"> \u2502 Exit EBITDA = Entry_EBITDA \u00d7 (1 + g)^hold \u00d7 (1 + \u0394margin)"))
+            q.put(("log", f"> \u2502 Exit EV     = Exit_EBITDA \u00d7 Exit_Multiple"))
+            q.put(("log", f"> \u2502 MOIC        = Equity_Exit / Equity_Invested"))
+            q.put(("log", f"> \u2502 IRR         = MOIC^(1/hold) \u2212 1"))
+            q.put(("log", f"> \u2502"))
+            q.put(("log", f"> \u2502 Results:"))
+            q.put(("log", f"> \u2502   IRR  P50={result.irr_distribution.p50:.1%}  P10={result.irr_distribution.p10:.1%}  P90={result.irr_distribution.p90:.1%}"))
+            q.put(("log", f"> \u2502   MOIC P50={result.moic_distribution.p50:.2f}x  |  P(IRR>20%)={result.p_irr_gt_20:.0%}  P(IRR>25%)={result.p_irr_gt_25:.0%}"))
+            dec_icon = {
+                "priority": "\u2605 PRIORITY",
+                "pursue": "\u2192 PURSUE",
+                "auto_reject": "\u2717 REJECT",
+            }.get(result.screening_decision, result.screening_decision.upper())
+            dec_style = "+" if result.screening_decision != "auto_reject" else "-"
+            q.put(("log", f"{dec_style} \u2514\u2500 {dec_icon}  |  Bid: ${result.recommended_bid_range[0]:,.0f}\u2014${result.recommended_bid_range[1]:,.0f}"))
 
         q.put(("stage_done", "underwriting"))
         q.put(("done",))
@@ -496,7 +577,14 @@ class BloombergTerminal:
             return True
 
         if self.view == "loading":
-            if self.ps.complete and self.results and ch != -1:
+            if ch == curses.KEY_UP:
+                self.log_scroll_back = min(
+                    self.log_scroll_back + 3,
+                    max(0, len(self.ps.log_lines) - 1),
+                )
+            elif ch == curses.KEY_DOWN:
+                self.log_scroll_back = max(0, self.log_scroll_back - 3)
+            elif self.ps.complete and self.results and ch != -1:
                 self.view = "dashboard"
             return False
 
@@ -595,7 +683,7 @@ class BloombergTerminal:
     def _draw_footer(self) -> None:
         h, _ = self.scr.getmaxyx()
         footers = {
-            "loading": " Q:QUIT",
+            "loading": " \u2191\u2193:SCROLL LOG  Q:QUIT",
             "dashboard": " \u2191\u2193:NAV  ENTER:DETAIL  S:SORT  D:DIR  T:COMPS  R:RERUN  H:HELP  Q:QUIT",
             "detail": " ESC:BACK  \u2190\u2192:PREV/NEXT  \u2191\u2193:SCROLL  T:COMPS  Q:QUIT",
             "comps": " ESC:BACK  Q:QUIT",
@@ -617,6 +705,7 @@ class BloombergTerminal:
         ga = curses.color_pair(C_AMBER)
         gr = curses.color_pair(C_RED)
         gd = curses.color_pair(C_DIM)
+        gy = curses.color_pair(C_CYAN)
 
         self._w(y, 2, "PIPELINE STATUS", gc | curses.A_BOLD)
         y += 1
@@ -668,19 +757,12 @@ class BloombergTerminal:
                 self._w(y, 20, detail, gd)
             y += 1
 
-        # Live substatus from Claude CLI
-        if ps.substatus and not ps.complete:
-            y += 1
-            # Truncate to fit screen, prefix with a dim arrow
-            self._w(y, 4, f"\u25B8 {ps.substatus}", curses.color_pair(C_CYAN))
-
         y += 1
         if ps.error:
             self._w(y, 2, f"ERROR: {ps.error}", gr | curses.A_BOLD)
             y += 1
 
         if ps.complete:
-            y += 1
             if self.results:
                 self._w(
                     y, 2,
@@ -689,6 +771,57 @@ class BloombergTerminal:
                 )
             else:
                 self._w(y, 2, "Complete \u2014 no qualifying deals found.", ga)
+            y += 1
+
+        y += 1
+
+        # ── Scrollable Activity Log ──────────────────────────────────
+        self._hl(y, "\u2500", gd)
+        self._w(y, 2, " ACTIVITY LOG ", ga | curses.A_BOLD)
+        y += 1
+
+        log_area_height = max(1, h - y - 2)
+        lines = ps.log_lines
+        total = len(lines)
+
+        if self.log_scroll_back == 0:
+            start = max(0, total - log_area_height)
+        else:
+            start = max(0, total - log_area_height - self.log_scroll_back)
+
+        end = min(total, start + log_area_height)
+
+        for idx in range(start, end):
+            if y >= h - 1:
+                break
+            line = lines[idx]
+            if line.startswith("!"):
+                attr = ga | curses.A_BOLD
+                text = line[2:] if len(line) > 2 else line
+            elif line.startswith(">"):
+                attr = gy
+                text = line[2:] if len(line) > 2 else line
+            elif line.startswith("+"):
+                attr = gc
+                text = line[2:] if len(line) > 2 else line
+            elif line.startswith("-"):
+                attr = gr
+                text = line[2:] if len(line) > 2 else line
+            elif line.startswith("~"):
+                attr = gd
+                text = line[2:] if len(line) > 2 else line
+            else:
+                attr = gd
+                text = line
+            self._w(y, 3, text, attr)
+            y += 1
+
+        if total > log_area_height:
+            scroll_pct = end / total if total > 0 else 1.0
+            indicator = f"[{end}/{total}]"
+            if self.log_scroll_back > 0:
+                indicator += " \u2191SCROLL"
+            self._w(h - 2, max(0, w - len(indicator) - 2), indicator, gd)
 
     # ── Dashboard View ───────────────────────────────────────────────────
 
