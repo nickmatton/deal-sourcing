@@ -38,6 +38,9 @@ def normalize_company(
     if raw.estimated_ebitda and raw.estimated_revenue and raw.estimated_revenue > 0:
         ebitda_margin = raw.estimated_ebitda / raw.estimated_revenue
 
+    # Pick up hiring data stashed by the enrichment pipeline
+    hiring_data = raw.__dict__.get("_hiring_data", {})
+
     return CompanyNormalized(
         entity_id=entity_id,
         name=raw.name.strip(),
@@ -57,4 +60,7 @@ def normalize_company(
         funding_total_usd=raw.funding_total,
         source_records=[f"{raw.source}:{raw.source_id}"],
         data_freshness=raw.ingested_at,
+        open_positions=hiring_data.get("open_positions"),
+        hiring_departments=hiring_data.get("hiring_departments", {}),
+        executive_searches=hiring_data.get("executive_searches"),
     )

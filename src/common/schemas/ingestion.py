@@ -71,6 +71,13 @@ class CompanyNormalized(BaseModel):
         default_factory=lambda: datetime.now().isoformat()
     )
 
+    # Enrichment signals (populated by free-data connectors)
+    open_positions: int | None = None
+    hiring_departments: dict[str, int] = Field(default_factory=dict)
+    executive_searches: int | None = None
+    federal_contract_total: float | None = None
+    federal_contract_count: int | None = None
+
 
 class TransactionRecord(BaseModel):
     """Historical M&A/PE transaction for training and comps."""

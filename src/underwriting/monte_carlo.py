@@ -102,7 +102,8 @@ class MonteCarloSimulator:
         from datetime import datetime, timezone
 
         n = assumptions.num_simulations
-        np.random.seed(42)
+        seed = hash(entity_id) % (2**31)
+        np.random.seed(seed)
 
         # Sample entry EBITDA
         entry_ebitda = np.random.normal(
@@ -217,31 +218,89 @@ class MonteCarloSimulator:
         )
         return result
 
+    def _run_deterministic_scenario(
+        self, assumptions: LBOAssumptions, **overrides: float
+    ) -> float:
+        """Run a single-point IRR calculation using median assumptions with overrides.
+
+        Each keyword argument replaces the median value for that parameter.
+        Returns the median IRR from a small simulation with the override applied.
+        """
+        n = 2_000
+
+        entry_ebitda_val = overrides.get("entry_ebitda", assumptions.entry_ebitda_mean)
+        entry_multiple_val = overrides.get(
+            "entry_multiple", assumptions.entry_multiple_mode
+        )
+        rev_growth_val = overrides.get("revenue_growth", assumptions.revenue_growth_mean)
+        margin_improvement_val = overrides.get(
+            "margin_improvement", assumptions.margin_improvement_mode
+        )
+        exit_bear = assumptions.exit_multiple_bear or assumptions.entry_multiple_low
+        exit_base = assumptions.exit_multiple_base or assumptions.entry_multiple_mode
+        exit_bull = assumptions.exit_multiple_bull or assumptions.entry_multiple_high
+        exit_multiple_val = overrides.get("exit_multiple", exit_base)
+        equity_pct_val = 1.0 - overrides.get(
+            "leverage",
+            (assumptions.debt_equity_low + assumptions.debt_equity_high) / 2,
+        )
+        hold_val = overrides.get(
+            "hold_period", float(np.median(assumptions.hold_periods))
+        )
+
+        entry_ev = np.full(n, entry_ebitda_val * entry_multiple_val)
+        equity_pct = np.full(n, equity_pct_val)
+        ebitda_exit = np.full(
+            n, entry_ebitda_val * (1 + rev_growth_val) ** hold_val * (1 + margin_improvement_val)
+        )
+        exit_mult = np.full(n, exit_multiple_val)
+        hold_arr = np.full(n, hold_val)
+
+        irr, _ = compute_irr_vectorized(
+            entry_ev, equity_pct, ebitda_exit, exit_mult, hold_arr,
+            assumptions.interest_rate,
+        )
+        return float(np.median(irr))
+
     def _compute_sensitivities(
         self, assumptions: LBOAssumptions, base_irr: float
     ) -> list[Sensitivity]:
-        """Simplified sensitivity analysis on key parameters."""
-        sensitivities = [
-            Sensitivity(
-                parameter="entry_multiple",
-                base_irr=base_irr,
-                low_irr=base_irr + 0.05,  # Lower multiple = higher IRR
-                high_irr=base_irr - 0.05,
-                impact=0.10,
-            ),
-            Sensitivity(
-                parameter="revenue_growth",
-                base_irr=base_irr,
-                low_irr=base_irr - 0.04,
-                high_irr=base_irr + 0.04,
-                impact=0.08,
-            ),
-            Sensitivity(
-                parameter="exit_multiple",
-                base_irr=base_irr,
-                low_irr=base_irr - 0.06,
-                high_irr=base_irr + 0.06,
-                impact=0.12,
-            ),
+        """Tornado-chart sensitivity analysis.
+
+        For each key parameter, holds all others at their median/mode values
+        and swings the target parameter to its low and high bounds.  The
+        resulting IRR delta is the true sensitivity, not a hardcoded offset.
+        """
+        base = self._run_deterministic_scenario(assumptions)
+
+        exit_bear = assumptions.exit_multiple_bear or assumptions.entry_multiple_low
+        exit_bull = assumptions.exit_multiple_bull or assumptions.entry_multiple_high
+
+        param_specs: list[tuple[str, str, float, float]] = [
+            ("entry_multiple", "entry_multiple",
+             assumptions.entry_multiple_low, assumptions.entry_multiple_high),
+            ("revenue_growth", "revenue_growth",
+             assumptions.revenue_growth_mean - 2 * assumptions.revenue_growth_std,
+             assumptions.revenue_growth_mean + 2 * assumptions.revenue_growth_std),
+            ("exit_multiple", "exit_multiple", exit_bear, exit_bull),
+            ("margin_improvement", "margin_improvement",
+             assumptions.margin_improvement_low, assumptions.margin_improvement_high),
+            ("leverage", "leverage",
+             assumptions.debt_equity_low, assumptions.debt_equity_high),
         ]
+
+        sensitivities: list[Sensitivity] = []
+        for label, key, low_val, high_val in param_specs:
+            low_irr = self._run_deterministic_scenario(assumptions, **{key: low_val})
+            high_irr = self._run_deterministic_scenario(assumptions, **{key: high_val})
+            impact = abs(high_irr - low_irr)
+            sensitivities.append(Sensitivity(
+                parameter=label,
+                base_irr=base,
+                low_irr=low_irr,
+                high_irr=high_irr,
+                impact=impact,
+            ))
+
+        sensitivities.sort(key=lambda s: s.impact, reverse=True)
         return sensitivities

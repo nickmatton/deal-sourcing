@@ -22,9 +22,13 @@ from pathlib import Path
 import numpy as np
 import structlog
 
+from src.alpha_detection.scorer import AlphaScorer
+from src.common.config import get_settings
+from src.common.dataset import DatasetAccumulator
 from src.common.schemas.ingestion import CompanyNormalized, TransactionRecord
+from src.ingestion.enrichment import enrich_companies
 from src.common.schemas.underwriting import LBOAssumptions, UnderwritingResult
-from src.common.schemas.valuation import ShadowValuation
+from src.common.schemas.valuation import AlphaScore, ShadowValuation
 from src.entity_resolution.engine import EntityResolutionEngine
 from src.ingestion.connectors.claude_research import ClaudeResearchConnector
 from src.ingestion.normalizers.company import normalize_company
@@ -32,6 +36,12 @@ from src.thesis_matching.hard_filter import filter_universe
 from src.thesis_matching.thesis_schema import InvestmentThesis, ThesisStore
 from src.underwriting.monte_carlo import MonteCarloSimulator
 from src.valuation.engine import ShadowValuationEngine
+
+try:
+    from src.thesis_matching.semantic_matcher import SemanticMatcher, build_company_description
+    _HAS_SEMANTIC = True
+except ImportError:
+    _HAS_SEMANTIC = False
 
 # ── Color Pairs ──────────────────────────────────────────────────────────────
 
@@ -51,12 +61,13 @@ STAGES = [
     ("entity_resolution", "RESOLVE"),
     ("thesis_matching", "THESIS"),
     ("valuation", "VALUE"),
+    ("alpha_detection", "ALPHA"),
     ("underwriting", "UNDERWRITE"),
 ]
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-SORT_COLS = ["company", "revenue", "ebitda", "ev", "irr", "moic", "decision"]
+SORT_COLS = ["company", "revenue", "ebitda", "ev", "alpha", "irr", "moic", "decision"]
 
 
 @dataclass
@@ -70,6 +81,7 @@ class PipelineState:
     rejected_count: int = 0
     txn_count: int = 0
     val_count: int = 0
+    alpha_count: int = 0
     uw_count: int = 0
     running: bool = False
     complete: bool = False
@@ -109,6 +121,8 @@ class BloombergTerminal:
         self.transactions: list[TransactionRecord] = []
         self.valuations: list[tuple[CompanyNormalized, ShadowValuation]] = []
         self.results: list[tuple[CompanyNormalized, ShadowValuation, UnderwritingResult]] = []
+        self.alpha_results: dict[str, AlphaScore] = {}
+        self.semantic_scores: dict[str, float] = {}
 
         # Pipeline state
         self.ps = PipelineState()
@@ -118,7 +132,7 @@ class BloombergTerminal:
         self.view = "loading"
         self.sel = 0
         self.scroll = 0
-        self.sort_idx = 4  # IRR by default
+        self.sort_idx = 5  # IRR by default
         self.sort_desc = True
         self.detail_scroll = 0
         self.log_scroll_back = 0
@@ -265,6 +279,11 @@ class BloombergTerminal:
             self.companies = ev[1]
             self.ps.filtered_count = len(ev[1])
             self.ps.rejected_count = ev[2]
+        elif k == "semantic":
+            self.semantic_scores = ev[1]
+        elif k == "alpha":
+            self.alpha_results[ev[1]] = ev[2]
+            self.ps.alpha_count = len(self.alpha_results)
         elif k == "val":
             self.valuations.append((ev[1], ev[2]))
             self.ps.val_count = len(self.valuations)
@@ -293,6 +312,8 @@ class BloombergTerminal:
         self.transactions.clear()
         self.valuations.clear()
         self.results.clear()
+        self.alpha_results.clear()
+        self.semantic_scores.clear()
         self.thesis = None
         self.view = "loading"
         self.sel = 0
@@ -370,6 +391,32 @@ class BloombergTerminal:
             q.put(("done",))
             return
 
+        # ── Free-Data Enrichment ─────────────────────────────────────────
+        try:
+            settings = get_settings()
+            q.put(("substatus", "Enriching with free public data..."))
+            enrichment_results = await enrich_companies(
+                raw,
+                fmp_api_key=settings.fmp_api_key,
+                edgar_identity=settings.edgar_identity,
+                on_progress=lambda msg: q.put(("substatus", msg)),
+            )
+            enriched = [r for r in enrichment_results if r.fields_updated]
+            if enriched:
+                q.put(("log", ""))
+                q.put(("log", f"! \u2500\u2500 Free-Data Enrichment ({len(enriched)}/{len(raw)} matched) \u2500\u2500\u2500\u2500"))
+                for r in enrichment_results:
+                    if r.ticker and r.fields_updated:
+                        fields = ", ".join(f.split(" (")[0] for f in r.fields_updated)
+                        sources = ", ".join(r.sources_used)
+                        q.put(("log", f"+ {r.company_name:<28} [{r.ticker}] {fields}  via {sources}"))
+                    elif r.ticker:
+                        q.put(("log", f"> {r.company_name:<28} [{r.ticker}] no new data"))
+                    else:
+                        q.put(("log", f"~ {r.company_name:<28} no ticker found"))
+        except Exception as e:
+            q.put(("log", f"- Enrichment error: {e}"))
+
         # ── Stage: Entity Resolution ─────────────────────────────────────
         q.put(("stage_start", "entity_resolution"))
         try:
@@ -404,6 +451,27 @@ class BloombergTerminal:
                     q.put(("log", f"+ \u2713 {c.name}"))
                 for c, gaps in rejected:
                     q.put(("log", f"- \u2717 {c.name} ({', '.join(gaps)})"))
+
+                # Semantic similarity scoring on passing companies
+                if _HAS_SEMANTIC and targets and thesis:
+                    try:
+                        q.put(("substatus", "Computing semantic thesis similarity..."))
+                        matcher = SemanticMatcher()
+                        descriptions = [build_company_description(c) for c in targets]
+                        ranked = matcher.rank_companies(
+                            thesis_description=thesis.description,
+                            company_descriptions=descriptions,
+                            company_ids=[c.entity_id for c in targets],
+                        )
+                        sem_scores = {eid: score for eid, score in ranked}
+                        q.put(("semantic", sem_scores))
+                        q.put(("log", ""))
+                        q.put(("log", "! \u2500\u2500 Semantic Thesis Fit \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"))
+                        for eid, score in ranked:
+                            name = next((c.name for c in targets if c.entity_id == eid), eid[:8])
+                            q.put(("log", f"+ {name:<30} {score:.0%} match"))
+                    except Exception as e:
+                        q.put(("log", f"- Semantic matching unavailable: {e}"))
 
                 q.put(("stage_done", "thesis_matching"))
             except Exception as e:
@@ -445,6 +513,8 @@ class BloombergTerminal:
                     multiple_features=np.zeros(10),
                     known_revenue=known_revenue,
                     known_ebitda=known_ebitda,
+                    comparable_transactions=self.transactions,
+                    company_sector=company.industry_primary,
                 )
                 val_pairs.append((company, val))
                 q.put(("val", company, val))
@@ -474,6 +544,25 @@ class BloombergTerminal:
                 continue
 
         q.put(("stage_done", "valuation"))
+
+        # ── Stage: Alpha Detection ───────────────────────────────────────
+        q.put(("stage_start", "alpha_detection"))
+        alpha_scorer = AlphaScorer()
+        alpha_log_entries: list[tuple[str, float, bool, str]] = []
+        for company, val in val_pairs:
+            alpha = alpha_scorer.score(company, val, self.transactions)
+            q.put(("alpha", company.entity_id, alpha))
+            signals_str = ", ".join(s.signal_type for s in alpha.alpha_signals[:3])
+            alpha_log_entries.append((company.name, alpha.alpha_score, alpha.efficiently_priced, signals_str))
+
+        q.put(("log", ""))
+        q.put(("log", "! \u2500\u2500 Alpha Detection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"))
+        for name, score, efficiently_priced, signals_str in alpha_log_entries:
+            label = "ALPHA" if not efficiently_priced else "EFFICIENT"
+            icon = "+" if not efficiently_priced else ">"
+            q.put(("log", f"{icon} {name:<30} {score:.2f} ({label})  [{signals_str}]"))
+
+        q.put(("stage_done", "alpha_detection"))
 
         # ── Stage: Underwriting ──────────────────────────────────────────
         q.put(("stage_start", "underwriting"))
@@ -534,6 +623,27 @@ class BloombergTerminal:
             q.put(("log", f"{dec_style} \u2514\u2500 {dec_icon}  |  Bid: ${result.recommended_bid_range[0]:,.0f}\u2014${result.recommended_bid_range[1]:,.0f}"))
 
         q.put(("stage_done", "underwriting"))
+
+        # ── Persist to dataset ───────────────────────────────────────────
+        try:
+            ds = DatasetAccumulator("data/live")
+            ds.save_companies(normalized)
+            ds.save_transactions(self.transactions)
+            ds.save_valuations([v for _, v in val_pairs])
+            ds.save_underwriting([r for _, _, r in self.results if hasattr(r, 'model_dump')])
+            ds.save_pipeline_run(
+                command="terminal",
+                sector=self.sector,
+                geography=self.geography,
+                companies=len(normalized),
+                transactions=len(self.transactions),
+                valuations=len(val_pairs),
+            )
+            q.put(("log", ""))
+            q.put(("log", "+ Dataset saved to data/live/"))
+        except Exception as e:
+            q.put(("log", f"- Dataset save error: {e}"))
+
         q.put(("done",))
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -555,6 +665,9 @@ class BloombergTerminal:
                 return v.estimated_ebitda or 0
             if col == "ev":
                 return v.ev_point_estimate
+            if col == "alpha":
+                a = self.alpha_results.get(c.entity_id)
+                return a.alpha_score if a else 0
             if col == "irr":
                 return u.irr_distribution.p50
             if col == "moic":
@@ -748,6 +861,8 @@ class BloombergTerminal:
                 detail = f"{ps.filtered_count} passed, {ps.rejected_count} rejected"
             elif stage_id == "valuation" and ps.val_count:
                 detail = f"{ps.val_count} valued"
+            elif stage_id == "alpha_detection" and ps.alpha_count:
+                detail = f"{ps.alpha_count} scored"
             elif stage_id == "underwriting" and ps.uw_count:
                 detail = f"{ps.uw_count} underwritten"
 
@@ -844,7 +959,7 @@ class BloombergTerminal:
         flow = (
             f"{self.ps.raw_count}\u2192{self.ps.resolved_count}"
             f"\u2192{self.ps.filtered_count}\u2192{self.ps.val_count}"
-            f"\u2192{self.ps.uw_count}"
+            f"\u2192{self.ps.alpha_count}\u2192{self.ps.uw_count}"
         )
         self._w(y, 1, breadcrumb, gc)
         self._w(y, max(1, w - len(flow) - 2), flow, curses.color_pair(C_CYAN))
@@ -862,8 +977,8 @@ class BloombergTerminal:
 
         # Table header
         hdr = self._fmt_table_row(
-            "#", "COMPANY", "SECTOR", "REV $M", "EBITDA", "EV $M",
-            "MULT", "IRR P50", "MOIC", "DECISION",
+            "#", "COMPANY", "SECTOR", "REV $M", "EV $M",
+            "MULT", "ALPHA", "IRR P50", "MOIC", "DECISION",
         )
         self._wl(y, hdr, ga)
         y += 1
@@ -885,13 +1000,14 @@ class BloombergTerminal:
             c, v, u = self.results[i]
 
             rev_s = f"{v.estimated_revenue / 1e6:.1f}" if v.estimated_revenue else "\u2014"
-            eb_s = f"{v.estimated_ebitda / 1e6:.1f}" if v.estimated_ebitda else "\u2014"
             ev_s = f"{v.ev_point_estimate / 1e6:.1f}"
             ml_s = (
                 f"{v.implied_ev_ebitda_multiple:.1f}x"
                 if v.implied_ev_ebitda_multiple
                 else "\u2014"
             )
+            a = self.alpha_results.get(c.entity_id)
+            alpha_s = f"{a.alpha_score:.2f}" if a else "\u2014"
             irr_s = f"{u.irr_distribution.p50:.1%}"
             moic_s = f"{u.moic_distribution.p50:.2f}x"
             dec_s = {
@@ -904,7 +1020,7 @@ class BloombergTerminal:
                 str(i + 1),
                 c.name[:22],
                 (c.industry_primary or "\u2014")[:14],
-                rev_s, eb_s, ev_s, ml_s, irr_s, moic_s, dec_s,
+                rev_s, ev_s, ml_s, alpha_s, irr_s, moic_s, dec_s,
             )
 
             if i == self.sel:
@@ -946,12 +1062,12 @@ class BloombergTerminal:
 
     @staticmethod
     def _fmt_table_row(
-        num: str, co: str, sec: str, rev: str, eb: str,
-        ev: str, ml: str, ir: str, mo: str, dc: str,
+        num: str, co: str, sec: str, rev: str,
+        ev: str, ml: str, al: str, ir: str, mo: str, dc: str,
     ) -> str:
         return (
-            f" {num:>3} {co:<22} {sec:<14} {rev:>8} {eb:>8}"
-            f" {ev:>8} {ml:>6} {ir:>7} {mo:>6} {dc:>11}"
+            f" {num:>3} {co:<22} {sec:<14} {rev:>8}"
+            f" {ev:>8} {ml:>6} {al:>6} {ir:>7} {mo:>6} {dc:>11}"
         )
 
     # ── Detail View ──────────────────────────────────────────────────────
@@ -1009,6 +1125,9 @@ class BloombergTerminal:
         lines.append(("kv", f"Founded:     {c.founded_year or 'N/A'}", ""))
         lines.append(("kv", f"Employees:   {c.employee_count or 'N/A'}", ""))
         lines.append(("kv", f"Ownership:   {c.ownership_type.value}", ""))
+        sem = self.semantic_scores.get(c.entity_id)
+        if sem is not None:
+            lines.append(("kv", f"Thesis fit:  {sem:.0%} semantic match", ""))
 
         lines.append(("sep",))
 
@@ -1046,6 +1165,21 @@ class BloombergTerminal:
         lines.append(("kv", "", f"Downside:    {u.downside_irr:.1%} IRR"))
 
         lines.append(("sep",))
+
+        # Alpha Detection
+        alpha = self.alpha_results.get(c.entity_id)
+        if alpha:
+            priced_label = "EFFICIENTLY PRICED" if alpha.efficiently_priced else "ALPHA DETECTED"
+            lines.append(("hdr", "ALPHA DETECTION", priced_label))
+            lines.append(("kv", f"Alpha Score: {alpha.alpha_score:.2f}", ""))
+            for sig in alpha.alpha_signals:
+                bar_len = min(int(sig.strength * 30), 30)
+                sig_bar = "\u2588" * bar_len + "\u2591" * (30 - bar_len)
+                lines.append(("kv", f" {sig.signal_type:<22} {sig_bar}  {sig.strength:.0%}", ""))
+                desc = sig.description[:min(len(sig.description), max(w - 6, 40))]
+                lines.append(("kv", f"   {desc}", ""))
+
+            lines.append(("sep",))
 
         # IRR Range Visual + Bid Analysis
         lines.append(("hdr", "IRR RANGE", "BID ANALYSIS"))

@@ -17,7 +17,10 @@ from pathlib import Path
 
 import numpy as np
 
+from src.alpha_detection.scorer import AlphaScorer
 from src.common.config import get_settings
+from src.common.dataset import DatasetAccumulator
+from src.ingestion.enrichment import enrich_companies
 from src.common.logging import (
     PipelineStage,
     configure_logging,
@@ -35,6 +38,12 @@ from src.thesis_matching.thesis_schema import InvestmentThesis, ThesisStore
 from src.underwriting.monte_carlo import MonteCarloSimulator
 from src.valuation.engine import ShadowValuationEngine
 from src.valuation.margin_estimator import MarginEstimator
+
+try:
+    from src.thesis_matching.semantic_matcher import SemanticMatcher, build_company_description
+    _HAS_SEMANTIC = True
+except ImportError:
+    _HAS_SEMANTIC = False
 
 
 async def run_pipeline(
@@ -97,6 +106,32 @@ async def run_pipeline(
                 txlog.info("received", transactions=len(transactions))
 
         # =============================================
+        # STAGE 0A+: Free-Data Enrichment
+        # =============================================
+        with log_stage(PipelineStage.INGESTION, source="free_data_enrichment") as slog:
+            settings = get_settings()
+            enrichment_results = await enrich_companies(
+                raw_companies,
+                fmp_api_key=settings.fmp_api_key,
+                edgar_identity=settings.edgar_identity,
+            )
+            enriched_count = sum(1 for r in enrichment_results if r.fields_updated)
+            slog.info(
+                "enrichment_complete",
+                total=len(raw_companies),
+                enriched=enriched_count,
+                tickers_found=sum(1 for r in enrichment_results if r.ticker),
+            )
+            for r in enrichment_results:
+                if r.fields_updated:
+                    slog.debug(
+                        "enriched",
+                        company=r.company_name,
+                        ticker=r.ticker,
+                        fields=r.fields_updated,
+                    )
+
+        # =============================================
         # STAGE 0B: Entity Resolution
         # =============================================
         with log_stage(PipelineStage.ENTITY_RESOLUTION, input_count=len(raw_companies)) as slog:
@@ -111,8 +146,9 @@ async def run_pipeline(
             slog.info("resolved", entities=len(normalized))
 
         # =============================================
-        # STAGE 2: Thesis Matching (hard filter)
+        # STAGE 2: Thesis Matching (hard filter + semantic)
         # =============================================
+        semantic_scores: dict[str, float] = {}
         if thesis:
             with log_stage(PipelineStage.THESIS_MATCHING, thesis_id=thesis.id) as slog:
                 passing, rejected = filter_universe(normalized, thesis)
@@ -124,6 +160,27 @@ async def run_pipeline(
                     rejected=len(rejected),
                 )
                 targets = passing
+
+                # Semantic similarity scoring on passing companies
+                if _HAS_SEMANTIC and targets:
+                    with log_step("semantic_matching", slog) as sem_log:
+                        try:
+                            matcher = SemanticMatcher()
+                            descriptions = [build_company_description(c) for c in targets]
+                            ranked = matcher.rank_companies(
+                                thesis_description=thesis.description,
+                                company_descriptions=descriptions,
+                                company_ids=[c.entity_id for c in targets],
+                            )
+                            for eid, score in ranked:
+                                semantic_scores[eid] = score
+                            sem_log.info(
+                                "semantic_scored",
+                                count=len(ranked),
+                                top_score=round(ranked[0][1], 3) if ranked else 0,
+                            )
+                        except Exception as e:
+                            sem_log.warning("semantic_matching_failed", error=str(e))
         else:
             targets = normalized
 
@@ -166,12 +223,30 @@ async def run_pipeline(
                         multiple_features=np.zeros(10),
                         known_revenue=known_revenue,
                         known_ebitda=known_ebitda,
+                        comparable_transactions=transactions,
+                        company_sector=company.industry_primary,
                     )
                     valuations.append((company, val))
                 except ValueError as e:
                     slog.warning("valuation_skipped", company=company.name, reason=str(e))
 
             slog.info("valued", count=len(valuations))
+
+        # =============================================
+        # STAGE 3B: Alpha Detection
+        # =============================================
+        alpha_results = {}
+        with log_stage(PipelineStage.ALPHA_DETECTION, target_count=len(valuations)) as slog:
+            alpha_scorer = AlphaScorer()
+            for company, val in valuations:
+                alpha = alpha_scorer.score(company, val, transactions)
+                alpha_results[company.entity_id] = alpha
+            slog.info(
+                "alpha_scored",
+                total=len(alpha_results),
+                high_alpha=sum(1 for a in alpha_results.values() if a.alpha_score > 0.3),
+                efficiently_priced=sum(1 for a in alpha_results.values() if a.efficiently_priced),
+            )
 
         # =============================================
         # STAGE 5: Rapid Underwriting (Monte Carlo)
@@ -218,6 +293,29 @@ async def run_pipeline(
             )
 
         # =============================================
+        # PERSIST TO DATASET
+        # =============================================
+        ds = DatasetAccumulator("data/live")
+        ds.save_companies(normalized)
+        ds.save_transactions(transactions)
+        ds.save_valuations([val for _, val in valuations])
+        ds.save_alpha_scores(list(alpha_results.values()))
+        ds.save_underwriting([uw for _, _, uw in underwriting_results])
+        ds.save_enrichment_log(enrichment_results)
+        ds.save_pipeline_run(
+            command="run",
+            sector=sector,
+            geography=geography,
+            thesis=thesis.id if thesis else None,
+            companies_researched=len(raw_companies),
+            companies_enriched=enriched_count,
+            transactions=len(transactions),
+            targets_after_filter=len(targets),
+            valuations=len(valuations),
+            underwriting_results=len(underwriting_results),
+        )
+
+        # =============================================
         # RESULTS SUMMARY
         # =============================================
         plog.info("pipeline_results", total_targets=len(underwriting_results))
@@ -230,6 +328,7 @@ async def run_pipeline(
         print("=" * 90)
         print(f"  Sector: {sector or 'all'}  |  Geography: {geography}  |  Thesis: {thesis.id if thesis else 'none'}")
         print(f"  Companies researched: {len(raw_companies)}  |  Transactions found: {len(transactions)}")
+        print(f"  Enriched from public data: {enriched_count}/{len(raw_companies)}")
         if thesis:
             print(f"  Passed thesis filter: {len(targets)}/{len(normalized)}")
         print("=" * 90)
@@ -240,6 +339,8 @@ async def run_pipeline(
                 "pursue": " -> PURSUE",
                 "auto_reject": " x REJECT",
             }.get(uw.screening_decision, "")
+
+            alpha = alpha_results.get(company.entity_id)
 
             print(f"\n  {company.name}{decision_marker}")
             print(f"  {'─' * 60}")
@@ -253,6 +354,14 @@ async def run_pipeline(
                 print(f"  EBITDA:      ${val.estimated_ebitda:,.0f}  ({val.estimated_ebitda / val.estimated_revenue:.0%} margin)" if val.estimated_revenue else f"  EBITDA:      ${val.estimated_ebitda:,.0f}")
             print(f"  EV estimate: ${val.ev_point_estimate:,.0f}  (range: ${val.ev_range_80ci[0]:,.0f} - ${val.ev_range_80ci[1]:,.0f})")
             print(f"  Multiple:    {val.implied_ev_ebitda_multiple:.1f}x EBITDA" if val.implied_ev_ebitda_multiple else "")
+            sem_score = semantic_scores.get(company.entity_id)
+            if sem_score is not None:
+                print(f"  Thesis fit:  {sem_score:.0%} semantic match")
+            if alpha:
+                priced_label = "EFFICIENTLY PRICED" if alpha.efficiently_priced else "ALPHA DETECTED"
+                print(f"  Alpha:       {alpha.alpha_score:.2f}  ({priced_label})")
+                for sig in alpha.alpha_signals[:3]:
+                    print(f"               - {sig.signal_type}: {sig.description[:80]}")
             print(f"  IRR (P50):   {uw.irr_distribution.p50:.1%}  |  MOIC (P50): {uw.moic_distribution.p50:.2f}x")
             print(f"  P(IRR>20%):  {uw.p_irr_gt_20:.0%}  |  P(IRR>25%): {uw.p_irr_gt_25:.0%}")
             print(f"  Downside:    {uw.downside_irr:.1%} IRR  |  Break-even: {uw.break_even_multiple:.1f}x exit")

@@ -18,31 +18,6 @@ class DatabaseSettings(BaseSettings):
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
 
-class RedisSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="REDIS_")
-
-    host: str = "localhost"
-    port: int = 6379
-    db: int = 0
-
-    @property
-    def url(self) -> str:
-        return f"redis://{self.host}:{self.port}/{self.db}"
-
-
-class KafkaSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="KAFKA_")
-
-    bootstrap_servers: str = "localhost:9092"
-
-
-class MLflowSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="MLFLOW_")
-
-    tracking_uri: str = "http://localhost:5000"
-    experiment_name: str = "deal-sourcing"
-
-
 class LLMSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LLM_")
 
@@ -64,10 +39,13 @@ class PipelineSettings(BaseSettings):
     log_level: str = "INFO"
 
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
-    redis: RedisSettings = Field(default_factory=RedisSettings)
-    kafka: KafkaSettings = Field(default_factory=KafkaSettings)
-    mlflow: MLflowSettings = Field(default_factory=MLflowSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
+
+    fmp_api_key: str = Field(default="", alias="FMP_API_KEY")
+    edgar_identity: str = Field(
+        default="deal-sourcing-poc research@example.com",
+        alias="EDGAR_IDENTITY",
+    )
 
     sell_probability_threshold: float = 0.3
     thesis_fit_score_threshold: float = 0.5

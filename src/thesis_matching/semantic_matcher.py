@@ -1,9 +1,32 @@
 """Semantic similarity matching between thesis descriptions and company descriptions."""
 
+from __future__ import annotations
+
 import numpy as np
 import structlog
 
+from src.common.schemas.ingestion import CompanyNormalized
+
 logger = structlog.get_logger("thesis_matching.semantic")
+
+
+def build_company_description(company: CompanyNormalized) -> str:
+    """Build a text description of a company suitable for embedding."""
+    parts = [company.name]
+    if company.description:
+        parts.append(company.description)
+    if company.industry_primary:
+        parts.append(f"Industry: {company.industry_primary}")
+    loc_parts = [p for p in [company.hq_city, company.hq_state, company.hq_country] if p]
+    if loc_parts:
+        parts.append(f"Location: {', '.join(loc_parts)}")
+    if company.estimated_revenue_usd:
+        parts.append(f"Revenue: ${company.estimated_revenue_usd:,.0f}")
+    if company.employee_count:
+        parts.append(f"Employees: {company.employee_count}")
+    if company.ownership_type.value != "unknown":
+        parts.append(f"Ownership: {company.ownership_type.value}")
+    return ". ".join(parts)
 
 
 class SemanticMatcher:
